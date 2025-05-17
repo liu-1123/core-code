@@ -4,9 +4,9 @@ import torch.nn.functional as F
 from torchvision import models
 from typing import Optional
 
-# 轻量级通道注意力模块（LECA）- 仅使用平均池化，与论文一致
+# 轻量级通道注意力模块（LECA）
 class ChannelAttention(nn.Module):
-    """轻量级通道注意力模块，仅使用平均池化，激活函数修改为与论文一致"""
+    """轻量级通道注意力模块，仅使用平均池化，激活函数为Hard-Sigmoid"""
     
     def __init__(self, channels: int, reduction: int = 16):
         super().__init__()
@@ -15,13 +15,13 @@ class ChannelAttention(nn.Module):
             nn.Conv2d(channels, channels // reduction, kernel_size=1, bias=False),
             nn.ReLU(inplace=True),
             nn.Conv2d(channels // reduction, channels, kernel_size=1, bias=False),
-            nn.Sigmoid()  # 论文中使用的激活函数
+            nn.Hardswish()  # PyTorch中Hardswish近似Hard-Sigmoid
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x * self.fc(self.avg_pool(x))
+        return x * self.fc(self.avg_pool(x)).sigmoid()  # 应用Sigmoid归一化
 
-# 空间注意力模块 - 与论文一致
+# 空间注意力模块 
 class PositionAttention(nn.Module):
     """空间注意力模块，通过特征图的通道间关系生成空间注意力图"""
     
@@ -31,12 +31,9 @@ class PositionAttention(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 沿通道维度进行平均池化和最大池化
         avg_out = torch.mean(x, dim=1, keepdim=True)
         max_out, _ = torch.max(x, dim=1, keepdim=True)
         spatial = torch.cat([avg_out, max_out], dim=1)
-        
-        # 生成空间注意力图并应用
         spatial = self.sigmoid(self.conv(spatial))
         return x * spatial
 
@@ -46,12 +43,10 @@ class BasicBlock(nn.Module):
 
     def __init__(self, inplanes, planes, stride=1, downsample=None):
         super(BasicBlock, self).__init__()
-        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=3, stride=stride,
-                               padding=1, bias=False)
+        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
         self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1,
-                               padding=1, bias=False)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
         self.downsample = downsample
         self.stride = stride
@@ -70,7 +65,7 @@ class BasicBlock(nn.Module):
         out = self.conv2(out)
         out = self.bn2(out)
         
-        # 添加注意力机制
+        # 先通道注意力，再空间注意力
         out = self.ca(out)
         out = self.pa(out)
 
@@ -86,36 +81,31 @@ class BasicBlock(nn.Module):
 class ResNet18WithAttention(nn.Module):
     def __init__(self, num_classes=10, pretrained=False, in_channels=1):
         super(ResNet18WithAttention, self).__init__()
-        # 使用预训练ResNet18的权重
+        # 单通道输入时不加载预训练权重（避免通道不匹配）
+        if in_channels == 1 and pretrained:
+            pretrained = False
         resnet = models.resnet18(pretrained=pretrained)
         
         # 修改输入通道
-        if in_channels != 3:
-            self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
-            # 如果需要迁移预训练权重，复制前3个通道的权重
-            if pretrained and in_channels >= 3:
-                self.conv1.weight.data[:, :3, :, :] = resnet.conv1.weight.data.clone()
-        else:
-            self.conv1 = resnet.conv1
-            
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        if pretrained and in_channels == 3:
+            self.conv1.weight.data = resnet.conv1.weight.data.clone()  
+        
         self.bn1 = resnet.bn1
         self.relu = resnet.relu
         self.maxpool = resnet.maxpool
-        
-        # 使用修改后的残差块
         self.layer1 = self._make_layer(64, 64, 2)
         self.layer2 = self._make_layer(64, 128, 2, stride=2)
         self.layer3 = self._make_layer(128, 256, 2, stride=2)
         self.layer4 = self._make_layer(256, 512, 2, stride=2)
-        
         self.avgpool = resnet.avgpool
         self.fc = nn.Linear(512 * BasicBlock.expansion, num_classes)
         
         # 初始化权重
+        if in_channels != 3:
+            nn.init.kaiming_normal_(self.conv1.weight, mode='fan_out', nonlinearity='relu')
         for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, nn.BatchNorm2d):
+            if isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
@@ -123,17 +113,12 @@ class ResNet18WithAttention(nn.Module):
         downsample = None
         if stride != 1 or inplanes != planes * BasicBlock.expansion:
             downsample = nn.Sequential(
-                nn.Conv2d(inplanes, planes * BasicBlock.expansion,
-                          kernel_size=1, stride=stride, bias=False),
+                nn.Conv2d(inplanes, planes * BasicBlock.expansion, kernel_size=1, stride=stride, bias=False),
                 nn.BatchNorm2d(planes * BasicBlock.expansion),
             )
-
-        layers = []
-        layers.append(BasicBlock(inplanes, planes, stride, downsample))
-        inplanes = planes * BasicBlock.expansion
+        layers = [BasicBlock(inplanes, planes, stride, downsample)]
         for _ in range(1, blocks):
             layers.append(BasicBlock(inplanes, planes))
-
         return nn.Sequential(*layers)
 
     def forward(self, x):
@@ -141,25 +126,19 @@ class ResNet18WithAttention(nn.Module):
         x = self.bn1(x)
         x = self.relu(x)
         x = self.maxpool(x)
-
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
-
         x = self.avgpool(x)
         x = x.view(x.size(0), -1)
         x = self.fc(x)
-
         return x
 
 # 故障诊断模型主体
 class IndustrialFaultDetector(nn.Module):
-    """基于ResNet18的工业故障诊断模型，集成了注意力机制增强特征提取"""
-    
     def __init__(self, num_classes: int = 10, pretrained: bool = False, in_channels: int = 1):
         super().__init__()
-        # 使用自定义的ResNet18，每个残差块后都有注意力机制
         self.backbone = ResNet18WithAttention(num_classes, pretrained, in_channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -168,24 +147,20 @@ class IndustrialFaultDetector(nn.Module):
 # 模型训练与评估
 def initialize_training(
     model: nn.Module, 
-    learning_rate: float = 0.001,  # 与论文一致
-    weight_decay: float = 0.0001,  # 与论文一致
+    learning_rate: float = 0.001,  
+    weight_decay: float = 0.00001,  
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 ) -> tuple:
-    """初始化训练所需的组件，返回模型、优化器、损失函数和设备"""
     model = model.to(device)
-    
-    # 冻结前几层（根据论文描述）
+    # 冻结前几层（conv1, bn1, layer1, layer2）
     if hasattr(model, 'backbone'):
-        # 冻结conv1, bn1, layer1, layer2
         for name, param in model.backbone.named_parameters():
             if 'conv1' in name or 'bn1' in name or 'layer1' in name or 'layer2' in name:
                 param.requires_grad = False
-    
-    optimizer = torch.optim.Adam(  # 使用Adam优化器，与论文一致
+    optimizer = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()), 
         lr=learning_rate, 
-        weight_decay=weight_decay
+        weight_decay=weight_decay  # 1e-5
     )
     criterion = nn.CrossEntropyLoss()
     return model, optimizer, criterion, device
@@ -264,7 +239,7 @@ def train_model(
         model, learning_rate, weight_decay, device
     )
     
-    # 学习率调度器 - 使用StepLR，与论文一致
+    # 学习率调度器 
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer, step_size=7, gamma=0.1  # 每7个epoch衰减0.1倍
     )
@@ -299,7 +274,7 @@ def train_model(
 
 # 使用示例
 if __name__ == "__main__":
-    # 模型初始化 - 输入通道设为1，与论文中的振动信号处理一致
+    # 模型初始化 
     model = IndustrialFaultDetector(num_classes=5, pretrained=True, in_channels=1)
     
     # 这里需要添加数据加载器初始化代码
